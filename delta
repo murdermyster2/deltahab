@@ -1,0 +1,1626 @@
+--=====================================================================
+-- Delta Hub — модульный чит-скрипт для Murder Mystery 2
+-- PlaceId: 142823291
+-- Тема: голубая (Sky по умолчанию)
+--=====================================================================
+
+--====================
+-- 0. Проверка окружения
+--====================
+if game.PlaceId ~= 142823291 then
+    return warn("[Delta Hub] Скрипт работает только в MM2 (PlaceId 142823291)")
+end
+
+if getgenv().DeltaHub_Loaded then
+    return warn("[Delta Hub] Скрипт уже загружен")
+end
+getgenv().DeltaHub_Loaded = true
+
+--====================
+-- 1. lib/logger
+--====================
+local Logger = {}
+local LOG_PREFIX = "[Delta Hub]"
+local LOG_LEVEL = 2
+local LEVELS = { ERROR = 1, WARN = 2, INFO = 3 }
+
+local function joinArgs(...)
+    local t = {}
+    for i = 1, select("#", ...) do
+        t[i] = tostring((select(i, ...)))
+    end
+    return table.concat(t, " ")
+end
+
+function Logger.log(level, ...)
+    if LOG_LEVEL < LEVELS[level] then return end
+    local text = ("%s [%s] %s"):format(LOG_PREFIX, level, joinArgs(...))
+    if level == "ERROR" then warn(text) else print(text) end
+end
+
+function Logger.error(...) Logger.log("ERROR", ...) end
+function Logger.warn(...)  Logger.log("WARN", ...)  end
+function Logger.info(...)  Logger.log("INFO", ...)  end
+
+function Logger.try(label, fn, ...)
+    local ok, res = pcall(fn, ...)
+    if not ok then Logger.error(("%s failed: %s"):format(label, tostring(res))) end
+    return ok, res
+end
+
+--====================
+-- 2. lib/context
+--====================
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local TweenService     = game:GetService("TweenService")
+local ReplicatedStorage= game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local Lighting         = game:GetService("Lighting")
+local Stats            = game:GetService("Stats")
+
+local Context = {
+    Players = Players,
+    RunService = RunService,
+    TweenService = TweenService,
+    ReplicatedStorage = ReplicatedStorage,
+    UserInputService = UserInputService,
+    Lighting = Lighting,
+    Stats = Stats,
+    LocalPlayer = Players.LocalPlayer,
+    State = {
+        espEnabled = false,
+        autoFarmEnabled = false,
+        autoKillEnabled = false,
+        autoShootEnabled = false,
+        voidHideEnabled = false,
+        autoGrabGun = false,
+    },
+    Connections = {},
+    Roles = {},
+    UIElements = {},
+}
+
+function Context.getCharacter() return Context.LocalPlayer.Character end
+function Context.getHumanoid()
+    local c = Context.getCharacter()
+    return c and c:FindFirstChildOfClass("Humanoid")
+end
+function Context.getRootPart()
+    local c = Context.getCharacter()
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+function Context.isAlive()
+    local h = Context.getHumanoid()
+    return h ~= nil and h.Health > 0
+end
+
+--====================
+-- 3. lib/connection
+--====================
+local Connection = {}
+Connection.__index = Connection
+
+local tagRegistry = {}
+
+function Connection.new(context, signal, callback)
+    local self = setmetatable({}, Connection)
+    self.conn = signal:Connect(callback)
+    self.active = true
+    table.insert(context.Connections, self)
+    return self
+end
+
+function Connection.newTagged(context, tag, signal, callback)
+    local self = Connection.new(context, signal, callback)
+    tagRegistry[tag] = tagRegistry[tag] or {}
+    table.insert(tagRegistry[tag], self)
+    return self
+end
+
+function Connection:disconnect()
+    if self.active and self.conn then
+        self.conn:Disconnect()
+        self.active = false
+    end
+end
+
+function Connection.disconnectAll(context)
+    for _, c in ipairs(context.Connections) do c:disconnect() end
+    table.clear(context.Connections)
+    for tag in pairs(tagRegistry) do tagRegistry[tag] = nil end
+end
+
+function Connection.disconnectTag(tag)
+    local list = tagRegistry[tag]
+    if not list then return end
+    for _, c in ipairs(list) do c:disconnect() end
+    tagRegistry[tag] = nil
+end
+
+--====================
+-- 4. lib/roles
+--====================
+local Roles = {}
+local roleCache = {}
+
+local Remotes = ReplicatedStorage:WaitForChild("Remotes", 10)
+local Extras, Gameplay = nil, nil
+if Remotes then
+    Extras = Remotes:FindFirstChild("Extras")
+    Gameplay = Remotes:FindFirstChild("Gameplay")
+end
+local GetPlayerData = Extras and Extras:FindFirstChild("GetPlayerData")
+local PlayerDataChanged = Gameplay and Gameplay:FindFirstChild("PlayerDataChanged")
+
+local function applyRoleData(data)
+    if type(data) ~= "table" then return end
+    for name, info in pairs(data) do
+        local plr = Players:FindFirstChild(name)
+        if plr and type(info) == "table" and info.Role then
+            roleCache[plr.UserId] = info.Role
+        end
+    end
+end
+
+function Roles.refresh()
+    if not GetPlayerData then return end
+    local ok, data = pcall(function()
+        return GetPlayerData:InvokeServer()
+    end)
+    if ok and data then applyRoleData(data) end
+end
+
+function Roles.getFor(player)
+    if not player then return nil end
+    return roleCache[player.UserId]
+end
+
+if PlayerDataChanged then
+    PlayerDataChanged.OnClientEvent:Connect(applyRoleData)
+end
+Roles.refresh()
+
+Players.PlayerAdded:Connect(function() task.wait(1); Roles.refresh() end)
+Players.PlayerRemoving:Connect(function(plr) roleCache[plr.UserId] = nil end)
+
+task.spawn(function()
+    while task.wait(5) do Roles.refresh() end
+end)
+
+--====================
+-- 5. features/esp
+--====================
+local ESP = {}
+ESP.Settings = {
+    enabled = false,
+    showMurderer = true,
+    showSheriff = true,
+    showInnocent = false,
+    showHero = true,
+    showNames = true,
+}
+ESP.Colors = {
+    Murderer = Color3.fromRGB(255, 60, 60),
+    Sheriff  = Color3.fromRGB(60, 160, 255),
+    Innocent = Color3.fromRGB(120, 220, 255),
+    Hero     = Color3.fromRGB(255, 220, 100),
+}
+local espActive = {}
+
+local function shouldShow(role)
+    if role == "Murderer" then return ESP.Settings.showMurderer end
+    if role == "Sheriff"  then return ESP.Settings.showSheriff  end
+    if role == "Innocent" then return ESP.Settings.showInnocent end
+    if role == "Hero"     then return ESP.Settings.showHero     end
+    return false
+end
+
+local function createNameBillboard(player, color)
+    local char = player.Character
+    if not char then return nil end
+    local head = char:FindFirstChild("Head")
+    if not head then return nil end
+
+    local bb = Instance.new("BillboardGui")
+    bb.Name = "DeltaHubNameESP"
+    bb.AlwaysOnTop = true
+    bb.Size = UDim2.new(0, 200, 0, 30)
+    bb.StudsOffset = Vector3.new(0, 2.5, 0)
+    bb.Parent = head
+
+    local label = Instance.new("TextLabel")
+    label.BackgroundTransparency = 1
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 14
+    label.TextStrokeTransparency = 0
+    label.TextStrokeColor3 = Color3.new(0, 0, 0)
+    label.TextColor3 = color
+    label.Text = player.Name
+    label.Parent = bb
+    return bb
+end
+
+local function clearPlayerESP(player)
+    local data = espActive[player]
+    if not data then return end
+    if data.highlight then data.highlight:Destroy() end
+    if data.billboard then data.billboard:Destroy() end
+    espActive[player] = nil
+end
+
+local function applyPlayerESP(player)
+    if player == Players.LocalPlayer then return end
+    local role = Roles.getFor(player)
+    if not role then return end
+
+    local existing = espActive[player]
+
+    if not shouldShow(role) or not player.Character then
+        clearPlayerESP(player)
+        return
+    end
+
+    local color = ESP.Colors[role] or Color3.new(1, 1, 1)
+    local char = player.Character
+
+    local hl = char:FindFirstChild("DeltaHubESP")
+    if not hl then
+        hl = Instance.new("Highlight")
+        hl.Name = "DeltaHubESP"
+        hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        hl.FillTransparency = 0.5
+        hl.OutlineTransparency = 0
+        hl.Parent = char
+    end
+    hl.FillColor = color
+    hl.OutlineColor = color
+
+    if existing and existing.highlight and existing.highlight.Parent ~= char then
+        clearPlayerESP(player)
+    end
+
+    local bb = nil
+    if ESP.Settings.showNames then
+        local head = char:FindFirstChild("Head")
+        if head and not head:FindFirstChild("DeltaHubNameESP") then
+            bb = createNameBillboard(player, color)
+        else
+            bb = existing and existing.billboard or nil
+            if bb then
+                local lbl = bb:FindFirstChildOfClass("TextLabel")
+                if lbl then lbl.TextColor3 = color end
+            end
+        end
+    end
+
+    espActive[player] = { highlight = hl, billboard = bb }
+end
+
+function ESP.start(context)
+    ESP.Settings.enabled = true
+
+    Connection.newTagged(context, "esp", RunService.Heartbeat, function()
+        if not ESP.Settings.enabled then return end
+        for _, plr in ipairs(Players:GetPlayers()) do
+            Logger.try("ESP.apply", applyPlayerESP, plr)
+        end
+    end)
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        Connection.newTagged(context, "esp", plr.CharacterAdded, function()
+            task.wait(0.3)
+            Logger.try("ESP.apply", applyPlayerESP, plr)
+        end)
+    end
+
+    Connection.newTagged(context, "esp", Players.PlayerAdded, function(plr)
+        plr.CharacterAdded:Connect(function()
+            task.wait(0.3)
+            Logger.try("ESP.apply", applyPlayerESP, plr)
+        end)
+    end)
+
+    Connection.newTagged(context, "esp", Players.PlayerRemoving, function(plr)
+        clearPlayerESP(plr)
+    end)
+end
+
+function ESP.stop(context)
+    ESP.Settings.enabled = false
+    Connection.disconnectTag("esp")
+    for plr in pairs(espActive) do clearPlayerESP(plr) end
+end
+
+--====================
+-- 6. features/combat
+--====================
+local Combat = {}
+Combat.Settings = {
+    autoKill = false,
+    autoShoot = false,
+    predictionMultiplier = 2.5,
+}
+
+local function getPing()
+    local ok, v = pcall(function()
+        return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+    end)
+    return ok and v or 50
+end
+
+local function getKnife(context)
+    local char = context.getCharacter()
+    if not char then return nil end
+    local knife = char:FindFirstChild("Knife")
+    if knife then return knife end
+    local backpack = context.LocalPlayer:FindFirstChild("Backpack")
+    if backpack then
+        knife = backpack:FindFirstChild("Knife")
+        if knife then
+            knife.Parent = char
+            task.wait(0.1)
+            return knife
+        end
+    end
+    return nil
+end
+
+local function getGun(context)
+    local char = context.getCharacter()
+    if not char then return nil end
+    local gun = char:FindFirstChild("Gun")
+    if gun then return gun end
+    local backpack = context.LocalPlayer:FindFirstChild("Backpack")
+    if backpack then
+        gun = backpack:FindFirstChild("Gun")
+        if gun then
+            gun.Parent = char
+            task.wait(0.05)
+            return gun
+        end
+    end
+    return nil
+end
+
+local function stabPlayer(knife, target)
+    if not knife or not target.Character then return end
+    local head = target.Character:FindFirstChild("Head")
+    if not head then return end
+    local events = knife:FindFirstChild("Events")
+    if not events then return end
+    local stab = events:FindFirstChild("KnifeStabbed")
+    local touch = events:FindFirstChild("HandleTouched")
+    if stab then pcall(function() stab:FireServer() end) end
+    if touch then pcall(function() touch:FireServer(head) end) end
+end
+
+local function computePredictedCFrame(targetRoot)
+    local vel = targetRoot.Velocity
+    local dt = (getPing() / 1000) * Combat.Settings.predictionMultiplier
+    local speed = vel.Magnitude
+
+    local aimPos
+    if speed < 1 then
+        aimPos = targetRoot.Position + targetRoot.CFrame.LookVector * 2
+    else
+        local mult = 1 + (speed / 50)
+        aimPos = targetRoot.Position + vel * (dt * mult)
+    end
+
+    local origin = targetRoot.Position - targetRoot.CFrame.LookVector
+    return CFrame.new(origin), CFrame.new(aimPos)
+end
+
+function Combat.init(context)
+    Connection.newTagged(context, "autokill", RunService.Heartbeat, function()
+        if not Combat.Settings.autoKill then return end
+        if not context.isAlive() then return end
+
+        local knife = getKnife(context)
+        if not knife then return end
+
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= context.LocalPlayer and plr.Character then
+                if plr.Character:FindFirstChild("Head") then
+                    stabPlayer(knife, plr)
+                    task.wait(0.05)
+                end
+            end
+        end
+    end)
+
+    Connection.newTagged(context, "autoshoot", RunService.Heartbeat, function()
+        if not Combat.Settings.autoShoot then return end
+        if not context.isAlive() then return end
+
+        local murderer = nil
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if Roles.getFor(plr) == "Murderer" then murderer = plr; break end
+        end
+        if not murderer or not murderer.Character then return end
+
+        local gun = getGun(context)
+        if not gun then return end
+
+        local targetRoot = murderer.Character:FindFirstChild("HumanoidRootPart")
+        if not targetRoot then return end
+
+        local origin, aim = computePredictedCFrame(targetRoot)
+        local shoot = gun:FindFirstChild("Shoot")
+        if shoot and shoot:IsA("RemoteEvent") then
+            pcall(function() shoot:FireServer(origin, aim) end)
+        end
+    end)
+end
+
+--====================
+-- 7. features/autofarm
+--====================
+local AutoFarm = {}
+AutoFarm.State = {
+    farming = false,
+    allCollected = false,
+    currentCoins = 0,
+    maxCoins = 0,
+    noclipConn = nil,
+    originalParts = {},
+    currentTween = nil,
+    farmGravity = nil,
+    farmStartTime = 0,
+}
+
+local function returnCoinContainer()
+    for _, m in ipairs(workspace:GetChildren()) do
+        if m:IsA("Model") then
+            local cc = m:FindFirstChild("CoinContainer")
+            if cc then return cc end
+        end
+    end
+    return nil
+end
+
+local function findNearestCoin(container)
+    if not container then return nil, math.huge end
+    local root = Context.getRootPart()
+    if not root then return nil, math.huge end
+    local best, bestDist = nil, math.huge
+    for _, coin in ipairs(container:GetChildren()) do
+        if coin:GetAttribute("CoinID") == "Candy"
+            and coin:FindFirstChild("TouchInterest")
+            and coin.Transparency == 1 then
+            local d = (root.Position - coin.Position).Magnitude
+            if d < bestDist then best, bestDist = coin, d end
+        end
+    end
+    return best, bestDist
+end
+
+local function restoreGravity()
+    local root = Context.getRootPart()
+    if root then
+        for _, c in ipairs(root:GetChildren()) do
+            if c:IsA("BodyVelocity") or c:IsA("BodyGyro")
+                or c:IsA("BodyPosition") or c:IsA("BodyForce") then
+                c:Destroy()
+            end
+        end
+    end
+end
+
+local function stopFarming()
+    AutoFarm.State.farming = false
+    if AutoFarm.State.noclipConn then
+        AutoFarm.State.noclipConn:Disconnect()
+        AutoFarm.State.noclipConn = nil
+    end
+    if AutoFarm.State.currentTween then
+        pcall(function() AutoFarm.State.currentTween:Cancel() end)
+        AutoFarm.State.currentTween = nil
+    end
+    local char = Context.getCharacter()
+    if char then
+        for part, props in pairs(AutoFarm.State.originalParts) do
+            if part and part.Parent then
+                part.CanCollide = props.CanCollide
+                part.Massless = props.Massless
+            end
+        end
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then hum.PlatformStand = false end
+    end
+    AutoFarm.State.originalParts = {}
+    restoreGravity()
+end
+
+local function startFarming()
+    local char = Context.getCharacter()
+    if not char then return end
+    local root = char:FindFirstChild("HumanoidRootPart")
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not root or not hum then return end
+
+    AutoFarm.State.originalParts = {}
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            AutoFarm.State.originalParts[part] = {
+                CanCollide = part.CanCollide,
+                Massless = part.Massless,
+            }
+        end
+    end
+
+    if root:FindFirstChild("FarmGravity") then
+        root.FarmGravity:Destroy()
+    end
+    local bp = Instance.new("BodyPosition")
+    bp.Name = "FarmGravity"
+    bp.MaxForce = Vector3.new(0, math.huge, 0)
+    bp.D = 1000
+    bp.P = 10000
+    bp.Position = root.Position
+    bp.Parent = root
+    AutoFarm.State.farmGravity = bp
+
+    root.CFrame = root.CFrame - Vector3.new(0, 2.5, 0)
+    root.CFrame = root.CFrame * CFrame.Angles(math.rad(90), 0, 0)
+
+    hum.PlatformStand = true
+    hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+    hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+
+    AutoFarm.State.farming = true
+
+    if not AutoFarm.State.noclipConn then
+        AutoFarm.State.noclipConn = RunService.Stepped:Connect(function()
+            if AutoFarm.State.farming and Context.getCharacter() then
+                for _, part in ipairs(Context.getCharacter():GetDescendants()) do
+                    if part:IsA("BasePart") then part.CanCollide = false end
+                end
+            end
+        end)
+    end
+end
+
+local function farmTick()
+    if not AutoFarm.State.farming then return end
+    if not Context.isAlive() then
+        stopFarming()
+        return
+    end
+
+    local root = Context.getRootPart()
+    local container = returnCoinContainer()
+    if not root or not container then
+        stopFarming()
+        return
+    end
+
+    local coin = findNearestCoin(container)
+    if not coin then
+        stopFarming()
+        return
+    end
+
+    local distance = (root.Position - coin.Position).Magnitude
+    if distance <= 7.5 then
+        pcall(function()
+            firetouchinterest(root, coin, 0)
+            firetouchinterest(root, coin, 1)
+        end)
+    end
+end
+
+function AutoFarm.init(context)
+    local gameplay = ReplicatedStorage:FindFirstChild("Remotes")
+        and ReplicatedStorage.Remotes:FindFirstChild("Gameplay")
+    if gameplay then
+        local coinCollected = gameplay:FindFirstChild("CoinCollected")
+        if coinCollected then
+            coinCollected.OnClientEvent:Connect(function(coinType, current, max)
+                if coinType == "Candy" or coinType == "Coin" then
+                    AutoFarm.State.currentCoins = tonumber(current) or 0
+                    AutoFarm.State.maxCoins = tonumber(max) or 0
+                    if AutoFarm.State.currentCoins >= AutoFarm.State.maxCoins
+                        and AutoFarm.State.maxCoins > 0 then
+                        AutoFarm.State.allCollected = true
+                        if AutoFarm.State.farming then stopFarming() end
+                    else
+                        AutoFarm.State.allCollected = false
+                    end
+                end
+            end)
+        end
+        local roundStart = gameplay:FindFirstChild("RoundStart")
+        if roundStart then
+            roundStart.OnClientEvent:Connect(function()
+                AutoFarm.State.allCollected = false
+                AutoFarm.State.currentCoins = 0
+                AutoFarm.State.maxCoins = 0
+                if AutoFarm.State.farming then stopFarming() end
+            end)
+        end
+        local roundEnd = gameplay:FindFirstChild("RoundEndFade")
+        if roundEnd then
+            roundEnd.OnClientEvent:Connect(function()
+                AutoFarm.State.allCollected = false
+                AutoFarm.State.currentCoins = 0
+                AutoFarm.State.maxCoins = 0
+                if AutoFarm.State.farming then stopFarming() end
+            end)
+        end
+    end
+
+    Connection.newTagged(context, "autofarm", RunService.Heartbeat, function()
+        if not context.State.autoFarmEnabled then
+            if AutoFarm.State.farming then stopFarming() end
+            return
+        end
+        if AutoFarm.State.allCollected then
+            if AutoFarm.State.farming then stopFarming() end
+            return
+        end
+        local role = Roles.getFor(context.LocalPlayer)
+        if not role then return end
+        if role == "Murderer" then
+            if AutoFarm.State.farming then stopFarming() end
+            return
+        end
+        if not Context.isAlive() then return end
+
+        local container = returnCoinContainer()
+        if not container then return end
+        local coin = findNearestCoin(container)
+        if not coin then
+            if AutoFarm.State.farming then stopFarming() end
+            return
+        end
+
+        if not AutoFarm.State.farming then startFarming() end
+
+        local root = Context.getRootPart()
+        if not root then return end
+        root.Velocity = Vector3.new(0, 0, 0)
+        root.RotVelocity = Vector3.new(0, 0, 0)
+
+        local targetPos = coin.Position - Vector3.new(0, 2.5, 0)
+        local targetCF = CFrame.new(targetPos) * CFrame.Angles(math.rad(90), 0, 0)
+        local dist = (root.Position - targetPos).Magnitude
+        local info = TweenInfo.new(dist / 23, Enum.EasingStyle.Linear, Enum.EasingDirection.Out)
+
+        if AutoFarm.State.currentTween then
+            pcall(function() AutoFarm.State.currentTween:Cancel() end)
+        end
+        AutoFarm.State.currentTween = TweenService:Create(root, info, { CFrame = targetCF })
+        AutoFarm.State.currentTween:Play()
+    end)
+
+    Connection.newTagged(context, "autofarm", RunService.Heartbeat, function()
+        if AutoFarm.State.farming then farmTick() end
+    end)
+end
+
+function AutoFarm.start(context)
+    context.State.autoFarmEnabled = true
+    AutoFarm.State.farmStartTime = os.time()
+end
+
+function AutoFarm.stop(context)
+    context.State.autoFarmEnabled = false
+    stopFarming()
+end
+
+--====================
+-- 8. features/misc
+--====================
+local Misc = {}
+Misc.Settings = {
+    danceEnabled = false,
+    danceId = "127118661424463",
+    flingActive = false,
+    selectedFlingTarget = nil,
+    currentDanceTrack = nil,
+}
+
+local danceList = {
+    ["Dance 1"] = "127118661424463",
+    ["Dance 2"] = "82682811348660",
+    ["Dance 3"] = "10714340543",
+    ["Dance 4"] = "15609995579",
+}
+Misc.danceList = danceList
+
+local function findMap()
+    for _, m in ipairs(workspace:GetChildren()) do
+        if m:GetAttribute("MapID") then return m end
+    end
+end
+
+function Misc.tpToMap()
+    local char = Context.getCharacter()
+    if not char then return end
+    local map = findMap()
+    if not map then return end
+    local spawns = map:FindFirstChild("Spawns")
+    if not spawns then return end
+    local first = spawns:GetChildren()[1]
+    if first then
+        char.HumanoidRootPart.CFrame = first.CFrame
+    end
+end
+
+function Misc.tpToLobby()
+    local char = Context.getCharacter()
+    if not char then return end
+    local lobby = workspace:FindFirstChild("RegularLobby")
+    if not lobby then return end
+    local spawns = lobby:FindFirstChild("Spawns")
+    if not spawns then return end
+    local first = spawns:GetChildren()[1]
+    if first then char.HumanoidRootPart.CFrame = first.CFrame end
+end
+
+function Misc.tpToRole(roleName)
+    local char = Context.getCharacter()
+    if not char then return end
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= Context.LocalPlayer and plr.Character then
+            if Roles.getFor(plr) == roleName then
+                local root = plr.Character:FindFirstChild("HumanoidRootPart")
+                if root then
+                    char.HumanoidRootPart.CFrame = root.CFrame
+                    return
+                end
+            end
+        end
+    end
+end
+
+local function skidFling(target)
+    local myChar = Context.getCharacter()
+    local myHum = myChar and myChar:FindFirstChildOfClass("Humanoid")
+    local myRoot = myHum and myHum.RootPart
+    local targetChar = target.Character
+    if not targetChar or not myRoot then return end
+
+    local targetHum = targetChar:FindFirstChildOfClass("Humanoid")
+    local targetRoot = targetHum and targetHum.RootPart
+    if not targetRoot then return end
+
+    local oldPos = myRoot.CFrame
+    local oldDestroyHeight = workspace.FallenPartsDestroyHeight
+
+    local bv = Instance.new("BodyVelocity")
+    bv.Parent = myRoot
+    bv.Velocity = Vector3.new(0, 0, 0)
+    bv.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+
+    myHum:SetStateEnabled(Enum.HumanoidStateType.Seated, false)
+    workspace.FallenPartsDestroyHeight = 0 / 0
+
+    local startTime = tick()
+    while Misc.Settings.flingActive and tick() - startTime < 3 do
+        myRoot.CFrame = CFrame.new(targetRoot.Position) * CFrame.new(0, 1.5, 0)
+            * CFrame.Angles(math.rad(math.random(0, 360)), 0, 0)
+        myRoot.Velocity = Vector3.new(9e7, 9e7 * 10, 9e7)
+        myRoot.RotVelocity = Vector3.new(9e8, 9e8, 9e8)
+        RunService.Heartbeat:Wait()
+    end
+
+    bv:Destroy()
+    myHum:SetStateEnabled(Enum.HumanoidStateType.Seated, true)
+    workspace.FallenPartsDestroyHeight = oldDestroyHeight
+
+    if oldPos then
+        local t0 = tick()
+        repeat
+            myRoot.CFrame = oldPos * CFrame.new(0, 0.5, 0)
+            myHum:ChangeState("GettingUp")
+            for _, p in ipairs(myChar:GetChildren()) do
+                if p:IsA("BasePart") then
+                    p.Velocity = Vector3.zero
+                    p.RotVelocity = Vector3.zero
+                end
+            end
+            RunService.Heartbeat:Wait()
+        until (myRoot.Position - oldPos.Position).Magnitude < 25 or tick() - t0 > 5
+    end
+end
+
+function Misc.flingPlayer(target)
+    if Misc.Settings.flingActive then return end
+    if not target or not target.Parent or not target.Character then return end
+    Misc.Settings.flingActive = true
+    task.spawn(function()
+        Logger.try("Misc.fling", skidFling, target)
+        Misc.Settings.flingActive = false
+        local cam = workspace.CurrentCamera
+        if cam then
+            local hum = Context.getHumanoid()
+            if hum then cam.CameraSubject = hum end
+        end
+    end)
+end
+
+function Misc.flingRole(roleName)
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= Context.LocalPlayer and Roles.getFor(plr) == roleName then
+            Misc.flingPlayer(plr)
+            return true
+        end
+    end
+    return false
+end
+
+local function stopDance()
+    if Misc.Settings.currentDanceTrack then
+        pcall(function()
+            Misc.Settings.currentDanceTrack:Stop()
+            Misc.Settings.currentDanceTrack:Destroy()
+        end)
+        Misc.Settings.currentDanceTrack = nil
+    end
+end
+
+local function playDance()
+    local char = Context.getCharacter()
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    local animator = hum:FindFirstChildOfClass("Animator")
+    if not animator then
+        animator = Instance.new("Animator")
+        animator.Parent = hum
+    end
+    stopDance()
+    task.wait(0.1)
+    local anim = Instance.new("Animation")
+    anim.AnimationId = "rbxassetid://" .. tostring(Misc.Settings.danceId)
+    local ok = pcall(function()
+        local track = animator:LoadAnimation(anim)
+        track.Looped = true
+        track.Priority = Enum.AnimationPriority.Action
+        track:Play(0.1, 1, 1)
+        Misc.Settings.currentDanceTrack = track
+    end)
+    anim:Destroy()
+    if not ok then Logger.warn("Dance failed") end
+end
+
+function Misc.setDanceEnabled(enabled, danceName)
+    Misc.Settings.danceEnabled = enabled
+    if danceName and danceList[danceName] then
+        Misc.Settings.danceId = danceList[danceName]
+    end
+    if enabled then playDance() else stopDance() end
+end
+
+function Misc.init(context)
+    context.LocalPlayer.CharacterAdded:Connect(function()
+        task.wait(0.5)
+        if Misc.Settings.danceEnabled then playDance() end
+    end)
+end
+
+--====================
+-- 9. features/visuals
+--====================
+local Visuals = {}
+Visuals.Settings = {
+    walkSpeedEnabled = false,
+    walkSpeed = 16,
+    jumpPowerEnabled = false,
+    jumpPower = 50,
+    fovEnabled = false,
+    fov = 70,
+    watermarkEnabled = false,
+    forceFieldEnabled = false,
+    forceFieldColor = Color3.fromRGB(0, 170, 255),
+    chinaHatEnabled = false,
+    chinaHatColor = Color3.fromRGB(120, 220, 255),
+}
+local chinaHatParts = {}
+local watermarkTexts = nil
+
+local function applyWalkSpeed()
+    if not Visuals.Settings.walkSpeedEnabled then return end
+    local hum = Context.getHumanoid()
+    if hum then hum.WalkSpeed = Visuals.Settings.walkSpeed end
+end
+local function applyJumpPower()
+    if not Visuals.Settings.jumpPowerEnabled then return end
+    local hum = Context.getHumanoid()
+    if hum then hum.JumpPower = Visuals.Settings.jumpPower end
+end
+local function applyFOV()
+    if not Visuals.Settings.fovEnabled then return end
+    local cam = workspace.CurrentCamera
+    if cam then cam.FieldOfView = Visuals.Settings.fov end
+end
+
+local function applyForceField()
+    if not Visuals.Settings.forceFieldEnabled then return end
+    local char = Context.getCharacter()
+    if not char then return end
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            local insideTool = false
+            local p = part.Parent
+            while p and p ~= char do
+                if p:IsA("Tool") then insideTool = true; break end
+                p = p.Parent
+            end
+            if not insideTool then
+                part.Material = Enum.Material.ForceField
+                part.Color = Visuals.Settings.forceFieldColor
+            end
+        end
+    end
+end
+
+local function createChinaHat()
+    for _, obj in ipairs(chinaHatParts) do
+        pcall(function() obj:Destroy() end)
+    end
+    chinaHatParts = {}
+    if not Visuals.Settings.chinaHatEnabled then return end
+    local char = Context.getCharacter()
+    if not char then return end
+    local head = char:FindFirstChild("Head")
+    if not head then return end
+
+    local part = Instance.new("Part")
+    part.Name = "DeltaChinaHat"
+    part.Size = Vector3.new(1, 1, 1)
+    part.Color = Visuals.Settings.chinaHatColor
+    part.Material = Enum.Material.Neon
+    part.Transparency = 0.2
+    part.CanCollide = false
+    part.Anchored = false
+    part.Parent = char
+    table.insert(chinaHatParts, part)
+
+    local mesh = Instance.new("SpecialMesh")
+    mesh.MeshType = Enum.MeshType.FileMesh
+    mesh.MeshId = "rbxassetid://1033714"
+    mesh.Scale = Vector3.new(1.7, 1.1, 1.7)
+    mesh.Parent = part
+    table.insert(chinaHatParts, mesh)
+
+    local weld = Instance.new("Weld")
+    weld.Part0 = head
+    weld.Part1 = part
+    weld.C0 = CFrame.new(0, 0.9, 0)
+    weld.Parent = part
+    table.insert(chinaHatParts, weld)
+end
+
+local function updateWatermark()
+    if not Visuals.Settings.watermarkEnabled then
+        if watermarkTexts then
+            for _, t in ipairs(watermarkTexts) do pcall(function() t:Remove() end) end
+            watermarkTexts = nil
+        end
+        return
+    end
+    if not Drawing then return end
+    if not watermarkTexts then
+        watermarkTexts = {}
+        watermarkTexts[1] = Drawing.new("Text")
+        watermarkTexts[1].Text = "delta"
+        watermarkTexts[1].Size = 18
+        watermarkTexts[1].Color = Color3.fromRGB(140, 200, 255)
+        watermarkTexts[1].Outline = true
+        watermarkTexts[1].Visible = true
+        watermarkTexts[1].Font = 3
+
+        watermarkTexts[2] = Drawing.new("Text")
+        watermarkTexts[2].Text = "hub"
+        watermarkTexts[2].Size = 18
+        watermarkTexts[2].Color = Color3.fromRGB(0, 170, 255)
+        watermarkTexts[2].Outline = true
+        watermarkTexts[2].Visible = true
+        watermarkTexts[2].Font = 3
+
+        watermarkTexts[3] = Drawing.new("Text")
+        watermarkTexts[3].Size = 14
+        watermarkTexts[3].Outline = true
+        watermarkTexts[3].Visible = true
+        watermarkTexts[3].Font = 3
+    end
+    local t1, t2, t3 = watermarkTexts[1], watermarkTexts[2], watermarkTexts[3]
+    if not (t1 and t2 and t3) then return end
+    local vp = workspace.CurrentCamera.ViewportSize
+    local bounds1 = t1.TextBounds
+    local bounds2 = t2.TextBounds
+    local totalW = bounds1.X + bounds2.X + 4
+    local base = Vector2.new(vp.X / 2 - totalW / 2, vp.Y / 2 - 9)
+    t1.Position = base
+    t2.Position = base + Vector2.new(bounds1.X + 4, 0)
+    local safe = Context.State.voidHideEnabled
+    t3.Text = safe and "Safe" or "Unsafe"
+    t3.Color = safe and Color3.fromRGB(0, 255, 0) or Color3.fromRGB(255, 0, 0)
+    t3.Position = base + Vector2.new(0, 20)
+end
+
+function Visuals.init(context)
+    Connection.newTagged(context, "visuals", RunService.Heartbeat, function()
+        Logger.try("Visuals.walkspeed", applyWalkSpeed)
+        Logger.try("Visuals.jump", applyJumpPower)
+        Logger.try("Visuals.fov", applyFOV)
+        Logger.try("Visuals.forcefield", applyForceField)
+        Logger.try("Visuals.watermark", updateWatermark)
+    end)
+
+    Connection.newTagged(context, "visuals", RunService.RenderStepped, function()
+        if watermarkTexts and Visuals.Settings.watermarkEnabled then
+            Logger.try("Visuals.watermark", updateWatermark)
+        end
+    end)
+
+    context.LocalPlayer.CharacterAdded:Connect(function()
+        task.wait(0.5)
+        if Visuals.Settings.chinaHatEnabled then createChinaHat() end
+        if Visuals.Settings.forceFieldEnabled then applyForceField() end
+    end)
+end
+
+function Visuals.setChinaHatEnabled(enabled)
+    Visuals.Settings.chinaHatEnabled = enabled
+    createChinaHat()
+end
+
+function Visuals.setWatermarkEnabled(enabled)
+    Visuals.Settings.watermarkEnabled = enabled
+    updateWatermark()
+end
+
+--====================
+-- 10. UI (библиотека tontov)
+--====================
+local Library
+local ok, res = pcall(function()
+    return loadstring(game:HttpGet(
+        "https://raw.githubusercontent.com/tontov/ScriptLibrary/refs/heads/main/Main"
+    ))()
+end)
+if not ok or not res then
+    return Logger.error("Не удалось загрузить UI-библиотеку: " .. tostring(res))
+end
+Library = res
+
+local Window = Library:CreateWindow({
+    Title = "Delta Hub",
+    Theme = "Sky",
+    Size = UDim2.fromOffset(570, 370),
+    Transparency = 0.1,
+    Blurring = true,
+    MinimizeKeybind = Enum.KeyCode.LeftAlt,
+})
+
+--====================
+-- 11. Темы (голубая палитра)
+--====================
+local Themes = {
+    Light = {
+        Primary        = Color3.fromRGB(232, 242, 250),
+        Secondary      = Color3.fromRGB(245, 250, 255),
+        Component      = Color3.fromRGB(225, 238, 250),
+        Interactables  = Color3.fromRGB(210, 228, 245),
+        Tab            = Color3.fromRGB(20, 90, 150),
+        Title          = Color3.fromRGB(0, 0, 0),
+        Description    = Color3.fromRGB(80, 110, 140),
+        Shadow         = Color3.fromRGB(255, 255, 255),
+        Outline        = Color3.fromRGB(180, 210, 235),
+        Icon           = Color3.fromRGB(60, 120, 180),
+    },
+    Blue = {
+        Primary        = Color3.fromRGB(20, 30, 45),
+        Secondary      = Color3.fromRGB(25, 40, 60),
+        Component      = Color3.fromRGB(30, 50, 75),
+        Interactables  = Color3.fromRGB(40, 65, 95),
+        Tab            = Color3.fromRGB(140, 200, 255),
+        Title          = Color3.fromRGB(220, 240, 255),
+        Description    = Color3.fromRGB(150, 190, 230),
+        Shadow         = Color3.fromRGB(0, 10, 20),
+        Outline        = Color3.fromRGB(50, 100, 150),
+        Icon           = Color3.fromRGB(120, 180, 240),
+    },
+    Ice = {
+        Primary        = Color3.fromRGB(15, 25, 35),
+        Secondary      = Color3.fromRGB(20, 35, 50),
+        Component      = Color3.fromRGB(25, 45, 65),
+        Interactables  = Color3.fromRGB(35, 60, 90),
+        Tab            = Color3.fromRGB(120, 220, 255),
+        Title          = Color3.fromRGB(180, 240, 255),
+        Description    = Color3.fromRGB(130, 200, 240),
+        Shadow         = Color3.fromRGB(0, 5, 15),
+        Outline        = Color3.fromRGB(40, 120, 170),
+        Icon           = Color3.fromRGB(140, 220, 255),
+    },
+    Sky = {
+        Primary        = Color3.fromRGB(235, 248, 255),
+        Secondary      = Color3.fromRGB(250, 254, 255),
+        Component      = Color3.fromRGB(220, 242, 255),
+        Interactables  = Color3.fromRGB(200, 232, 255),
+        Tab            = Color3.fromRGB(0, 120, 200),
+        Title          = Color3.fromRGB(0, 60, 120),
+        Description    = Color3.fromRGB(80, 140, 190),
+        Shadow         = Color3.fromRGB(255, 255, 255),
+        Outline        = Color3.fromRGB(160, 210, 245),
+        Icon           = Color3.fromRGB(30, 120, 200),
+    },
+}
+Window:SetTheme(Themes.Sky)
+
+--====================
+-- 12. TAB: Combat
+--====================
+local CombatTab = Window:AddTab({ Title = "Combat", Icon = "rbxassetid://11963373994" })
+Window:AddSection({ Name = "Murderer", Tab = CombatTab })
+
+Context.UIElements.autoKillToggle = Window:AddToggle({
+    Title = "Auto Kill All",
+    Description = "Автоматически убивает всех игроков (нужен нож)",
+    Default = false,
+    Tab = CombatTab,
+    Callback = function(v)
+        Combat.Settings.autoKill = v
+        Context.State.autoKillEnabled = v
+    end,
+})
+
+Window:AddButton({
+    Title = "Kill All",
+    Description = "Убить всех разово",
+    Tab = CombatTab,
+    Callback = function()
+        local knife = getKnife and getKnife(Context)
+        if not knife then
+            Window:Notify({ Title = "Нет ножа", Description = "Ты не убийца!", Duration = 3 })
+            return
+        end
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= Context.LocalPlayer and plr.Character then
+                stabPlayer(knife, plr)
+                task.wait(0.05)
+            end
+        end
+        Window:Notify({ Title = "Kill All", Description = "Попытка убить всех выполнена", Duration = 2 })
+    end,
+})
+
+Window:AddSection({ Name = "Sheriff", Tab = CombatTab })
+
+Context.UIElements.autoShootToggle = Window:AddToggle({
+    Title = "Auto Shoot Murderer",
+    Description = "Автострельба в убийцу с предсказанием",
+    Default = false,
+    Tab = CombatTab,
+    Callback = function(v)
+        Combat.Settings.autoShoot = v
+        Context.State.autoShootEnabled = v
+    end,
+})
+
+Window:AddSlider({
+    Title = "Prediction Multiplier",
+    Description = "Множитель предсказания (выше = агрессивнее)",
+    Tab = CombatTab,
+    Default = 2.5,
+    MinValue = 0.5,
+    MaxValue = 6,
+    AllowDecimals = true,
+    Callback = function(v) Combat.Settings.predictionMultiplier = v end,
+})
+
+--====================
+-- 13. TAB: AutoFarm
+--====================
+local FarmTab = Window:AddTab({ Title = "AutoFarm", Icon = "rbxassetid://11963373994" })
+Window:AddSection({ Name = "Coin Farm", Tab = FarmTab })
+
+Context.UIElements.autoFarmToggle = Window:AddToggle({
+    Title = "Farm Coins",
+    Description = "Автоматический сбор монет с noclip",
+    Default = false,
+    Tab = FarmTab,
+    Callback = function(v)
+        if v then
+            AutoFarm.start(Context)
+        else
+            AutoFarm.stop(Context)
+        end
+    end,
+})
+
+local FarmInfo = Window:AddInfoPanel({
+    Title = "AutoFarm Statistics",
+    Tab = FarmTab,
+    Data = {
+        ["Status"] = "Disabled",
+        ["Coins"] = "0/0",
+    },
+})
+
+task.spawn(function()
+    while task.wait(1) do
+        if Context.State.autoFarmEnabled then
+            FarmInfo:UpdateValue("Status",
+                AutoFarm.State.allCollected and "Все собрано"
+                or (AutoFarm.State.farming and "Фарм..." or "Ожидание"))
+            FarmInfo:UpdateValue("Coins",
+                ("%d/%d"):format(AutoFarm.State.currentCoins, AutoFarm.State.maxCoins))
+        else
+            FarmInfo:UpdateValue("Status", "Disabled")
+        end
+    end
+end)
+
+--====================
+-- 14. TAB: Visuals
+--====================
+local VisualsTab = Window:AddTab({ Title = "Visuals", Icon = "rbxassetid://11963373994" })
+Window:AddSection({ Name = "ESP", Tab = VisualsTab })
+
+local ESPMulti = Window:AddToggleMultiSelect({
+    Title = "Chams",
+    Description = "Подсветка игроков по ролям",
+    Options = { "Murderer", "Sheriff", "Innocent", "Hero" },
+    Enabled = false,
+    Tab = VisualsTab,
+    ToggleCallback = function(v)
+        if v then
+            ESP.Settings.showMurderer = true
+            ESP.Settings.showSheriff = true
+            ESP.Settings.showInnocent = false
+            ESP.Settings.showHero = true
+            ESP.start(Context)
+        else
+            ESP.stop(Context)
+        end
+    end,
+    DropdownCallback = function(selected)
+        ESP.Settings.showMurderer = false
+        ESP.Settings.showSheriff = false
+        ESP.Settings.showInnocent = false
+        ESP.Settings.showHero = false
+        for _, v in ipairs(selected) do
+            if v == "Murderer" then ESP.Settings.showMurderer = true end
+            if v == "Sheriff"  then ESP.Settings.showSheriff  = true end
+            if v == "Innocent" then ESP.Settings.showInnocent = true end
+            if v == "Hero"     then ESP.Settings.showHero     = true end
+        end
+    end,
+})
+
+Window:AddToggle({
+    Title = "ESP Names",
+    Description = "Показывать имена над головами",
+    Default = true,
+    Tab = VisualsTab,
+    Callback = function(v) ESP.Settings.showNames = v end,
+})
+
+Window:AddSection({ Name = "Character", Tab = VisualsTab })
+
+Window:AddToggle({
+    Title = "Custom WalkSpeed",
+    Default = false,
+    Tab = VisualsTab,
+    Callback = function(v) Visuals.Settings.walkSpeedEnabled = v end,
+})
+Window:AddSlider({
+    Title = "WalkSpeed",
+    Tab = VisualsTab,
+    Default = 16,
+    MinValue = 16,
+    MaxValue = 200,
+    AllowDecimals = false,
+    Callback = function(v) Visuals.Settings.walkSpeed = v end,
+})
+Window:AddToggle({
+    Title = "Custom JumpPower",
+    Default = false,
+    Tab = VisualsTab,
+    Callback = function(v) Visuals.Settings.jumpPowerEnabled = v end,
+})
+Window:AddSlider({
+    Title = "JumpPower",
+    Tab = VisualsTab,
+    Default = 50,
+    MinValue = 50,
+    MaxValue = 200,
+    AllowDecimals = false,
+    Callback = function(v) Visuals.Settings.jumpPower = v end,
+})
+Window:AddToggle({
+    Title = "Custom FOV",
+    Default = false,
+    Tab = VisualsTab,
+    Callback = function(v) Visuals.Settings.fovEnabled = v end,
+})
+Window:AddSlider({
+    Title = "FOV",
+    Tab = VisualsTab,
+    Default = 70,
+    MinValue = 70,
+    MaxValue = 120,
+    AllowDecimals = false,
+    Callback = function(v) Visuals.Settings.fov = v end,
+})
+
+Window:AddSection({ Name = "Cosmetics", Tab = VisualsTab })
+
+Window:AddToggle({
+    Title = "Force Field Body",
+    Description = "Материал тела = ForceField",
+    Default = false,
+    Tab = VisualsTab,
+    Callback = function(v) Visuals.Settings.forceFieldEnabled = v end,
+})
+Window:AddColorPicker({
+    Title = "ForceField Color",
+    Default = Color3.fromRGB(0, 170, 255),
+    Tab = VisualsTab,
+    Callback = function(c) Visuals.Settings.forceFieldColor = c end,
+})
+
+Window:AddToggle({
+    Title = "China Hat",
+    Default = false,
+    Tab = VisualsTab,
+    Callback = function(v) Visuals.setChinaHatEnabled(v) end,
+})
+Window:AddColorPicker({
+    Title = "China Hat Color",
+    Default = Color3.fromRGB(120, 220, 255),
+    Tab = VisualsTab,
+    Callback = function(c)
+        Visuals.Settings.chinaHatColor = c
+        if Visuals.Settings.chinaHatEnabled then Visuals.setChinaHatEnabled(true) end
+    end,
+})
+
+Window:AddSection({ Name = "Watermark", Tab = VisualsTab })
+Window:AddToggle({
+    Title = "Watermark",
+    Description = "Показывать водяной знак",
+    Default = false,
+    Tab = VisualsTab,
+    Callback = function(v) Visuals.setWatermarkEnabled(v) end,
+})
+
+--====================
+-- 15. TAB: Misc
+--====================
+local MiscTab = Window:AddTab({ Title = "Misc", Icon = "rbxassetid://11963373994" })
+
+Window:AddSection({ Name = "Teleports", Tab = MiscTab })
+Window:AddButton({
+    Title = "Map TP",
+    Description = "Телепорт в карту",
+    Tab = MiscTab,
+    Callback = function() Misc.tpToMap() end,
+})
+Window:AddButton({
+    Title = "Lobby TP",
+    Description = "Телепорт в лобби",
+    Tab = MiscTab,
+    Callback = function() Misc.tpToLobby() end,
+})
+Window:AddButton({
+    Title = "Murder TP",
+    Description = "Телепорт к убийце",
+    Tab = MiscTab,
+    Callback = function() Misc.tpToRole("Murderer") end,
+})
+Window:AddButton({
+    Title = "Sheriff TP",
+    Description = "Телепорт к шерифу",
+    Tab = MiscTab,
+    Callback = function() Misc.tpToRole("Sheriff") end,
+})
+
+Window:AddSection({ Name = "Fling", Tab = MiscTab })
+Window:AddButton({
+    Title = "Fling Murderer",
+    Description = "Флингнуть убийцу",
+    Tab = MiscTab,
+    Callback = function()
+        if not Misc.flingRole("Murderer") then
+            Window:Notify({ Title = "Ошибка", Description = "Убийца не найден", Duration = 2 })
+        end
+    end,
+})
+Window:AddButton({
+    Title = "Fling Sheriff",
+    Description = "Флингнуть шерифа",
+    Tab = MiscTab,
+    Callback = function()
+        if not Misc.flingRole("Sheriff") then
+            Window:Notify({ Title = "Ошибка", Description = "Шериф не найден", Duration = 2 })
+        end
+    end,
+})
+Window:AddInput({
+    Title = "Игрок для флинга",
+    Placeholder = "Имя игрока...",
+    Tab = MiscTab,
+    Callback = function(name)
+        local target = Players:FindFirstChild(name)
+        if target then
+            Misc.Settings.selectedFlingTarget = target
+            Window:Notify({ Title = "Выбран", Description = target.Name, Duration = 2 })
+        end
+    end,
+})
+Window:AddButton({
+    Title = "Fling Selected",
+    Tab = MiscTab,
+    Callback = function()
+        if Misc.Settings.selectedFlingTarget then
+            Misc.flingPlayer(Misc.Settings.selectedFlingTarget)
+        end
+    end,
+})
+
+Window:AddSection({ Name = "Emotes", Tab = MiscTab })
+Window:AddToggleDropdown({
+    Title = "Auto Dance",
+    Description = "Автотанец",
+    Options = { "Dance 1", "Dance 2", "Dance 3", "Dance 4" },
+    Default = "Dance 1",
+    Enabled = false,
+    Tab = MiscTab,
+    ToggleCallback = function(v) Misc.setDanceEnabled(v) end,
+    DropdownCallback = function(name) Misc.setDanceEnabled(Misc.Settings.danceEnabled, name) end,
+})
+
+--====================
+-- 16. TAB: Settings
+--====================
+local SettingsTab = Window:AddTab({ Title = "Settings", Icon = "rbxassetid://11293977610" })
+
+Window:AddSection({ Name = "UI", Tab = SettingsTab })
+Window:AddSingleSelect({
+    Title = "Theme",
+    Options = { "Light", "Blue", "Ice", "Sky" },
+    Default = "Sky",
+    Tab = SettingsTab,
+    Callback = function(name) Window:SetTheme(Themes[name]) end,
+})
+
+Window:AddSection({ Name = "Config", Tab = SettingsTab })
+
+local CONFIG_FOLDER = "DeltaHub"
+local CONFIG_EXT = ".json"
+if isfolder and not isfolder(CONFIG_FOLDER) then
+    pcall(makefolder, CONFIG_FOLDER)
+end
+
+local function listConfigs()
+    if not listfiles then return { "No configs" } end
+    local out = {}
+    for _, path in ipairs(listfiles(CONFIG_FOLDER)) do
+        local name = path:gsub("\\", "/"):match("([^/]+)" .. CONFIG_EXT .. "$")
+        if name then table.insert(out, name) end
+    end
+    if #out == 0 then table.insert(out, "No configs") end
+    return out
+end
+
+local currentConfig = "default"
+
+local configDropdown = Window:AddSingleSelect({
+    Title = "Config",
+    Options = listConfigs(),
+    Default = listConfigs()[1] or "default",
+    Tab = SettingsTab,
+    Callback = function(n) currentConfig = n end,
+})
+
+Window:AddInput({
+    Title = "Config name",
+    Placeholder = "default",
+    Tab = SettingsTab,
+    Callback = function(n) currentConfig = n end,
+})
+
+local function gatherSettings()
+    return {
+        combat = Combat.Settings,
+        esp = ESP.Settings,
+        visuals = Visuals.Settings,
+        misc = { danceEnabled = Misc.Settings.danceEnabled, danceId = Misc.Settings.danceId },
+        state = Context.State,
+    }
+end
+
+local function applySettings(s)
+    if type(s) ~= "table" then return end
+    for k, v in pairs(s.combat or {}) do Combat.Settings[k] = v end
+    for k, v in pairs(s.esp or {}) do ESP.Settings[k] = v end
+    for k, v in pairs(s.visuals or {}) do Visuals.Settings[k] = v end
+    if s.misc then
+        Misc.Settings.danceEnabled = s.misc.danceEnabled
+        Misc.Settings.danceId = s.misc.danceId or Misc.Settings.danceId
+    end
+    for k, v in pairs(s.state or {}) do Context.State[k] = v end
+end
+
+Window:AddButton({
+    Title = "Save Config",
+    Tab = SettingsTab,
+    Callback = function()
+        if not writefile then
+            Window:Notify({ Title = "Ошибка", Description = "writefile недоступен", Duration = 3 })
+            return
+        end
+        local path = CONFIG_FOLDER .. "/" .. currentConfig .. CONFIG_EXT
+        local data = game:GetService("HttpService"):JSONEncode(gatherSettings())
+        local ok, err = pcall(writefile, path, data)
+        if ok then
+            Window:Notify({ Title = "Сохранено", Description = currentConfig, Duration = 2 })
+            if configDropdown and configDropdown.Refresh then
+                configDropdown.Refresh(listConfigs())
+            end
+        else
+            Window:Notify({ Title = "Ошибка", Description = tostring(err), Duration = 3 })
+        end
+    end,
+})
+
+Window:AddButton({
+    Title = "Load Config",
+    Tab = SettingsTab,
+    Callback = function()
+        if not readfile then return end
+        local path = CONFIG_FOLDER .. "/" .. currentConfig .. CONFIG_EXT
+        if not (isfile and isfile(path)) then
+            Window:Notify({ Title = "Ошибка", Description = "Не найдено", Duration = 2 })
+            return
+        end
+        local ok, data = pcall(function()
+            return game:GetService("HttpService"):JSONDecode(readfile(path))
+        end)
+        if ok and data then
+            applySettings(data)
+            Window:Notify({ Title = "Загружено", Description = currentConfig, Duration = 2 })
+        end
+    end,
+})
+
+--====================
+-- 17. Запуск всех фич
+--====================
+Logger.info("Запуск фич...")
+Logger.try("ESP.init", ESP.start, Context)
+Logger.try("Combat.init", Combat.init, Context)
+Logger.try("AutoFarm.init", AutoFarm.init, Context)
+Logger.try("Visuals.init", Visuals.init, Context)
+Logger.try("Misc.init", Misc.init, Context)
+
+Window:Notify({
+    Title = "Delta Hub",
+    Description = "Загружено. Left Alt — свернуть.",
+    Duration = 8,
+})
+
+getgenv().DeltaHub = {
+    Context = Context,
+    ESP = ESP,
+    Combat = Combat,
+    AutoFarm = AutoFarm,
+    Visuals = Visuals,
+    Misc = Misc,
+    Roles = Roles,
+    unload = function()
+        Connection.disconnectAll(Context)
+        getgenv().DeltaHub_Loaded = nil
+        Logger.info("Выгружено")
+    end,
+}
+
+Logger.info("Готово.")
